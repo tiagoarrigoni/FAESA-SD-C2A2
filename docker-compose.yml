@@ -1,7 +1,96 @@
+x-comum: &comum
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false   # sem .env, usa os padroes abaixo (modo simulado do LLM)
+
+x-healthcheck-http: &hc-http
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 10s
+
 services:
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  # TAREFA 4: acrescente aqui os tres servicos (ingestao, recuperacao, geracao)
-  # depois de escrever um Dockerfile para cada um.
+  ingestao:
+    <<: *comum
+    build:
+      context: .
+      dockerfile: servicos/ingestao/Dockerfile
+    ports: ["8001:8001"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      INDICE_PATH: /dados/indice.json
+    volumes:
+      - indice:/dados
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-http
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/saude', timeout=3)"]
+
+  worker:
+    <<: *comum
+    build:
+      context: .
+      dockerfile: servicos/ingestao/Dockerfile.worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      INDICE_PATH: /dados/indice.json
+    volumes:
+      - indice:/dados
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, redis; redis.Redis.from_url(os.environ['REDIS_URL']).ping()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  recuperacao:
+    <<: *comum
+    build:
+      context: .
+      dockerfile: servicos/recuperacao/Dockerfile
+    ports: ["8002:8002"]
+    environment:
+      URL_INGESTAO: http://ingestao:8001
+    depends_on:
+      ingestao:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-http
+      # qualquer resposta HTTP (inclusive 4xx) indica que o servico esta de pe
+      test: ["CMD", "python", "-c", "import urllib.request as u, urllib.error as e\ntry: u.urlopen('http://localhost:8002/docs', timeout=3)\nexcept e.HTTPError: pass"]
+
+  geracao:
+    <<: *comum
+    build:
+      context: .
+      dockerfile: servicos/geracao/Dockerfile
+    ports: ["8003:8003"]
+    environment:
+      URL_RECUPERACAO: http://recuperacao:8002
+    depends_on:
+      recuperacao:
+        condition: service_healthy
+    healthcheck:
+      <<: *hc-http
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/saude', timeout=3)"]
+
+volumes:
+  indice:
