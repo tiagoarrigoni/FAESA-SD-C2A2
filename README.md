@@ -113,6 +113,10 @@ campos de `/saude` foram preservados; o log mostra o estado dos circuitos HTTP.
 
 ### Testes automatizados
 
+As evidências da execução com os três serviços reais em 22/10/2026 estão em
+[docs/VALIDACAO_RESILIENCIA.md](docs/VALIDACAO_RESILIENCIA.md), incluindo o teste
+de Redis indisponível e a falha do LLM ainda pendente na tarefa 3.
+
 Na raiz do repositório, com o ambiente virtual ativado:
 
 ```powershell
