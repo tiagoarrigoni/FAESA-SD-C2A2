@@ -57,6 +57,36 @@ curl -X POST http://localhost:8003/perguntar -H "Content-Type: application/json"
   -d '{"pergunta":"o que diz o teorema CAP?"}'
 ```
 
+### Alternativa: tudo com Docker (recomendado)
+
+Requer Docker com Compose v2. Sobe Redis, ingestão, recuperação, geração e 2 workers
+com um único comando, sem instalar nada em Python:
+
+```bash
+cp .env.example .env        # opcional: sem .env, o LLM roda em modo simulado
+docker compose up --build
+```
+
+| Serviço | Porta | Healthcheck | Depende de |
+|---|---|---|---|
+| `redis` | 6379 | `redis-cli ping` | - |
+| `ingestao` | 8001 | `GET /saude` | redis |
+| `worker` (2 réplicas) | - | ping no Redis | redis |
+| `recuperacao` | 8002 | `GET /docs` | ingestao |
+| `geracao` | 8003 | `GET /saude` | recuperacao |
+
+- Cada serviço tem seu `Dockerfile` em `servicos/<nome>/` (o worker usa
+  `servicos/ingestao/Dockerfile.worker`); o contexto de build é a raiz do projeto.
+- O `depends_on` usa `condition: service_healthy`: a ordem de subida é
+  `redis` → `ingestao`/`worker` → `recuperacao` → `geracao`.
+- O índice fica no volume nomeado `indice` (montado em `/dados`,
+  `INDICE_PATH=/dados/indice.json`), compartilhado entre ingestão e workers.
+  Sobrevive a `docker compose down`; para apagá-lo: `docker compose down -v`.
+- `REDIS_URL`, `URL_INGESTAO` e `URL_RECUPERACAO` são sobrescritas no compose para os
+  nomes dos serviços; `LLM_API_KEY` e demais variáveis do LLM vêm do `.env`.
+- Mais workers: `docker compose up --build --scale worker=4`.
+- Os `curl` dos passos 6 e 7 funcionam igual contra os containers.
+
 ---
 
 ## Estrutura do projeto
@@ -68,11 +98,21 @@ sd-2026-2-kit-c2a2/
 │   │   ├── embeddings.py       # PRONTO - vetorização offline
 │   │   ├── llm.py              # PRONTO - com modo simulado
 │   │   └── circuit_breaker.py  # PRONTO - modelo de referência
-│   ├── ingestao/app.py         # TAREFA 1
-│   ├── recuperacao/app.py      # TAREFA 2
-│   └── geracao/app.py          # TAREFA 3
+│   ├── ingestao/
+│   │   ├── app.py              # TAREFA 1
+│   │   ├── worker.py           # consumidor da fila (TAREFA 4)
+│   │   ├── Dockerfile          # imagem da API de ingestão
+│   │   └── Dockerfile.worker   # imagem do worker
+│   ├── recuperacao/
+│   │   ├── app.py              # TAREFA 2
+│   │   └── Dockerfile
+│   └── geracao/
+│       ├── app.py              # TAREFA 3
+│       └── Dockerfile
 ├── documentos/                 # base de teste para indexar
-├── docker-compose.yml          # TAREFA 4
+├── docker-compose.yml          # Redis + 3 serviços + 2 workers (TAREFA 4b)
+├── .dockerignore
+├── .env.example                # copie para .env
 └── TAREFAS.md                  # <- comece por aqui
 ```
 
