@@ -9,7 +9,7 @@ import os
 
 import requests
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from servicos.comum.embeddings import Vetorizador, similaridade
 
@@ -18,8 +18,8 @@ URL_INGESTAO = os.getenv("URL_INGESTAO", "http://localhost:8001")
 
 
 class Consulta(BaseModel):
-    pergunta: str
-    top_k: int = 3
+    pergunta: str = Field(min_length=1)
+    top_k: int = Field(default=3, ge=1)
 
 
 @app.post("/buscar")
@@ -29,10 +29,56 @@ def buscar(consulta: Consulta):
     r.raise_for_status()
     itens = r.json()["itens"]
 
-    # TAREFA 2: vetorize a pergunta, calcule a similaridade com cada item
-    # e devolva os top_k mais parecidos.
-    # DICA: use Vetorizador + similaridade() de servicos/comum/embeddings.py
-    raise NotImplementedError("implemente a busca por similaridade")
+    
+    # Se nao houver documentos, retorna uma lista vazia
+    if not itens:
+        return {
+            "pergunta": consulta.pergunta,
+            "resultados": []
+        }
+
+    # Extrai os textos dos documentos indexados
+    textos = [item["texto"] for item in itens]
+
+    # Cria e ajusta o vetorizador com os textos
+    vetorizador = Vetorizador()
+    vetorizador.ajustar(textos)
+
+    # Transforma a pergunta em um vetor numerico
+    vetor_pergunta = vetorizador.vetorizar(
+        consulta.pergunta
+    )
+
+    # Calcula a similaridade de cada documento
+    resultados = []
+
+    for item in itens:
+        vetor_documento = vetorizador.vetorizar(
+            item["texto"]
+        )
+
+        score = similaridade(
+            vetor_pergunta,
+            vetor_documento
+        )
+
+        resultados.append({
+            "texto": item["texto"],
+            "origem": item["origem"],
+            "score": score
+        })
+
+    # Ordena do mais relevante para o menos relevante
+    resultados.sort(
+        key=lambda resultado: resultado["score"],
+        reverse=True
+    )
+
+    # Retorna somente os top_k documentos
+    return {
+        "pergunta": consulta.pergunta,
+        "resultados": resultados[:consulta.top_k]
+    }
 
 
 @app.get("/saude")
