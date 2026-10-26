@@ -43,18 +43,62 @@ pip install -r requirements.txt
 # 4. Copie o arquivo de ambiente (funciona offline sem chave de LLM)
 cp .env.example .env
 
-# 5. Suba os três serviços, cada um em um terminal
+# 5. Com Redis acessivel em localhost:6379, suba cada processo em um terminal
 uvicorn servicos.ingestao.app:app     --port 8001
 uvicorn servicos.recuperacao.app:app  --port 8002
 uvicorn servicos.geracao.app:app      --port 8003
+python -m servicos.ingestao.worker
 
 # 6. Indexe os documentos de teste
 curl -X POST http://localhost:8001/indexar -H "Content-Type: application/json" \
   -d '[{"texto":"O teorema CAP trata de consistencia e disponibilidade.","origem":"aula11"}]'
 
-# 7. Pergunte (funciona depois da TAREFA 2)
+# 7. Consulte GET /indexacao/{id} com o id devolvido e aguarde status "pronto".
+# Depois pergunte:
 curl -X POST http://localhost:8003/perguntar -H "Content-Type: application/json" \
   -d '{"pergunta":"o que diz o teorema CAP?"}'
+```
+
+O arquivo `.env` e lido pelo Docker Compose. Na execucao local acima, as
+variaveis precisam estar no ambiente de cada processo; sem elas, sao usados
+os padroes de localhost e o modo simulado do LLM.
+
+### Execucao com Docker e demonstracao
+
+Com Docker e Compose instalados, na raiz do repositorio:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+O Compose inicia Redis, ingestao, recuperacao, geracao e duas replicas do worker,
+compartilhando o volume do indice. Quando os servicos estiverem saudaveis,
+execute a demonstracao no host, com o ambiente virtual ativado:
+
+```powershell
+python demo.py
+```
+
+O script do Davi, ajustado na integracao, envia listas de documentos, acompanha
+cada tarefa ate `pronto` (limite de 60 segundos por tarefa) e so depois pergunta.
+Mostra os nomes das fontes e calcula a cobertura lexical usando `contexto`.
+Essa cobertura mede sobreposicao de palavras, sem avaliar a veracidade da resposta.
+Se a indexacao falhar, a demonstracao termina com codigo 1. Reexecutar o script
+acrescenta os documentos novamente ao indice; use uma base de demonstracao separada
+quando precisar de uma quantidade fixa de documentos.
+
+```mermaid
+flowchart LR
+    Cliente -->|POST /indexar| Ingestao
+    Ingestao --> Redis
+    Redis --> Workers[Dois workers]
+    Workers --> Indice[Indice persistido]
+    Ingestao -->|leitura| Indice
+    Cliente -->|POST /perguntar| Geracao
+    Geracao -->|POST /buscar| Recuperacao
+    Recuperacao -->|GET /indice| Ingestao
+    Geracao --> LLM[LLM ou modo simulado]
 ```
 
 ---
@@ -113,9 +157,11 @@ campos de `/saude` foram preservados; o log mostra o estado dos circuitos HTTP.
 
 ### Testes automatizados
 
-As evidências da execução com os três serviços reais em 22/10/2026 estão em
-[docs/VALIDACAO_RESILIENCIA.md](docs/VALIDACAO_RESILIENCIA.md), incluindo o teste
-de Redis indisponível e a falha do LLM ainda pendente na tarefa 3.
+As evidências historicas de 22/10/2026 estão em
+[docs/VALIDACAO_RESILIENCIA.md](docs/VALIDACAO_RESILIENCIA.md). A integracao de
+26/10/2026 combina a protecao REST com a contribuicao do Daniel e resolve o
+500 do LLM registrado naquele baseline. Os resultados atuais estao em
+[docs/VALIDACAO_INTEGRACAO.md](docs/VALIDACAO_INTEGRACAO.md).
 
 Na raiz do repositório, com o ambiente virtual ativado:
 
@@ -127,7 +173,8 @@ Os testes incluem os existentes de persistência e similaridade, falhas e
 backoff simulados, concorrência do circuit breaker e testes HTTP reais em
 portas locais temporárias. Verificam 503 quando ingestão ou recuperação estão
 inacessíveis, propagação do 503, abertura e recuperação dos circuitos, além do
-fluxo normal com LLM simulado. Não exigem Redis, Docker, chave de API, pytest
+fluxo normal com LLM simulado, contingencia do LLM, abertura e recuperacao do
+circuito do LLM e o contrato da demonstracao. Não exigem Redis, Docker, chave de API, pytest
 ou httpx. A ingestão dos testes HTTP é uma API controlada com índice fixo.
 
 ### Roteiro manual de falhas no PowerShell
@@ -195,10 +242,16 @@ Consultar-API "http://localhost:8003/perguntar"
 
 Redis indisponível continua sendo tratado pela ingestão: `POST /indexar`
 deve devolver 503, enquanto `GET /indice` lê o disco e pode continuar
-atendendo a busca. A proteção da API real do LLM é a tarefa 3 do Daniel;
-não é validada pelos testes desta seção. O teste com containers depende do
-Compose do Luis Felipe: quando os serviços estiverem definidos, repita o
-roteiro usando `docker compose stop/start recuperacao` ou `ingestao`.
+atendendo a busca. A protecao do LLM do Daniel tambem esta integrada: nas duas
+primeiras consultas que esgotam as tentativas do LLM, a API preserva fontes e
+contexto e retorna 200 com `degradado: true`. A terceira abre o circuito e retorna
+503; consultas seguintes sao recusadas ate a sondagem apos 20 segundos.
+O timeout do LLM e configurado por `LLM_TIMEOUT`; as tres tentativas usam pausas
+de 0,5 s e 1 s. Sem `LLM_API_KEY`, continua funcionando no modo simulado.
+O Compose do Luis Felipe esta integrado. Para testar as falhas com containers,
+use `docker compose stop recuperacao` e `docker compose start recuperacao`,
+ou os mesmos comandos para `ingestao`. A execucao de containers nao foi validada
+nesta maquina porque Docker nao esta instalado.
 
 ---
 
