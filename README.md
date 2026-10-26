@@ -43,18 +43,62 @@ pip install -r requirements.txt
 # 4. Copie o arquivo de ambiente (funciona offline sem chave de LLM)
 cp .env.example .env
 
-# 5. Suba os três serviços, cada um em um terminal
+# 5. Com Redis acessivel em localhost:6379, suba cada processo em um terminal
 uvicorn servicos.ingestao.app:app     --port 8001
 uvicorn servicos.recuperacao.app:app  --port 8002
 uvicorn servicos.geracao.app:app      --port 8003
+python -m servicos.ingestao.worker
 
 # 6. Indexe os documentos de teste
 curl -X POST http://localhost:8001/indexar -H "Content-Type: application/json" \
   -d '[{"texto":"O teorema CAP trata de consistencia e disponibilidade.","origem":"aula11"}]'
 
-# 7. Pergunte (funciona depois da TAREFA 2)
+# 7. Consulte GET /indexacao/{id} com o id devolvido e aguarde status "pronto".
+# Depois pergunte:
 curl -X POST http://localhost:8003/perguntar -H "Content-Type: application/json" \
   -d '{"pergunta":"o que diz o teorema CAP?"}'
+```
+
+O arquivo `.env` e lido pelo Docker Compose. Na execucao local acima, as
+variaveis precisam estar no ambiente de cada processo; sem elas, sao usados
+os padroes de localhost e o modo simulado do LLM.
+
+### Execucao com Docker e demonstracao
+
+Com Docker e Compose instalados, na raiz do repositorio:
+
+```powershell
+docker compose up --build -d
+docker compose ps
+```
+
+O Compose inicia Redis, ingestao, recuperacao, geracao e duas replicas do worker,
+compartilhando o volume do indice. Quando os servicos estiverem saudaveis,
+execute a demonstracao no host, com o ambiente virtual ativado:
+
+```powershell
+python demo.py
+```
+
+O script do Davi, ajustado na integracao, envia listas de documentos, acompanha
+cada tarefa ate `pronto` (limite de 60 segundos por tarefa) e so depois pergunta.
+Mostra os nomes das fontes e calcula a cobertura lexical usando `contexto`.
+Essa cobertura mede sobreposicao de palavras, sem avaliar a veracidade da resposta.
+Se a indexacao falhar, a demonstracao termina com codigo 1. Reexecutar o script
+acrescenta os documentos novamente ao indice; use uma base de demonstracao separada
+quando precisar de uma quantidade fixa de documentos.
+
+```mermaid
+flowchart LR
+    Cliente -->|POST /indexar| Ingestao
+    Ingestao --> Redis
+    Redis --> Workers[Dois workers]
+    Workers --> Indice[Indice persistido]
+    Ingestao -->|leitura| Indice
+    Cliente -->|POST /perguntar| Geracao
+    Geracao -->|POST /buscar| Recuperacao
+    Recuperacao -->|GET /indice| Ingestao
+    Geracao --> LLM[LLM ou modo simulado]
 ```
 
 ---
@@ -75,6 +119,139 @@ sd-2026-2-kit-c2a2/
 ├── docker-compose.yml          # TAREFA 4
 └── TAREFAS.md                  # <- comece por aqui
 ```
+
+## Resiliência entre serviços — Vinicius (tarefa 3b)
+
+As chamadas `geração → POST /buscar → recuperação` e
+`recuperação → GET /indice → ingestão` usam o cliente compartilhado em
+`servicos/comum/http_resiliente.py`. A busca por similaridade, a persistência,
+a fila Redis e a chamada ao LLM mantêm suas implementações próprias.
+
+| Proteção | Comportamento |
+|---|---|
+| Timeout de conexão/leitura por tentativa | ingestão: 1 s / 2 s; recuperação: 1 s / 12 s |
+| Retentativa | até 3 tentativas, incluindo a primeira |
+| Backoff exponencial | espera de 0,2 s e 0,4 s entre tentativas |
+| Falhas repetidas | conexão, timeout e HTTP 429, 500, 502, 503, 504 |
+| Circuit breaker | abre após 3 consultas consecutivas malsucedidas, contando uma falha após esgotar as tentativas |
+| Recuperação do circuito | após 20 s, admite uma consulta de teste; sucesso fecha, falha reabre |
+| HTTP 503 | conexão, timeout, erro HTTP, JSON inválido, resposta fora do contrato ou circuito aberto |
+
+Outros erros HTTP (por exemplo, 400/404) e respostas inválidas não são repetidos.
+Cada dependência tem seu próprio circuito, em memória, por processo. O circuito
+do LLM (`disjuntor`) continua separado dos clientes HTTP. O estado `meio` admite
+uma única consulta lógica, incluindo suas tentativas, mesmo com requisições
+simultâneas. Respostas de chamadas antigas não fecham um circuito recém-aberto.
+
+Os 12 s de leitura da recuperação permitem que ela termine suas tentativas de
+acesso à ingestão (até aproximadamente 9,6 s somando os timeouts e o backoff).
+Esses valores são limites de conexão e inatividade de leitura do Requests,
+não um prazo total rígido. As retentativas das duas camadas podem produzir até
+9 acessos à ingestão para uma pergunta antes da abertura do circuito.
+O cliente deve ser usado somente para consultas seguras de repetir, como
+`GET /indice` e `POST /buscar`; não deve envolver `POST /indexar`.
+
+Tentativas, pausas e falhas são registradas em `logs/http_resiliente.log`,
+sem gravar perguntas ou documentos. O formato das respostas de sucesso e os
+campos de `/saude` foram preservados; o log mostra o estado dos circuitos HTTP.
+
+### Testes automatizados
+
+As evidências historicas de 22/10/2026 estão em
+[docs/VALIDACAO_RESILIENCIA.md](docs/VALIDACAO_RESILIENCIA.md). A integracao de
+26/10/2026 combina a protecao REST com a contribuicao do Daniel e resolve o
+500 do LLM registrado naquele baseline. Os resultados atuais estao em
+[docs/VALIDACAO_INTEGRACAO.md](docs/VALIDACAO_INTEGRACAO.md).
+
+Na raiz do repositório, com o ambiente virtual ativado:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Os testes incluem os existentes de persistência e similaridade, falhas e
+backoff simulados, concorrência do circuit breaker e testes HTTP reais em
+portas locais temporárias. Verificam 503 quando ingestão ou recuperação estão
+inacessíveis, propagação do 503, abertura e recuperação dos circuitos, além do
+fluxo normal com LLM simulado, contingencia do LLM, abertura e recuperacao do
+circuito do LLM e o contrato da demonstracao. Não exigem Redis, Docker, chave de API, pytest
+ou httpx. A ingestão dos testes HTTP é uma API controlada com índice fixo.
+
+### Roteiro manual de falhas no PowerShell
+
+Reinicie os serviços após atualizar o código. Em três terminais na raiz do
+repositório, com o ambiente virtual ativado, execute respectivamente:
+
+```powershell
+uvicorn servicos.ingestao.app:app --port 8001
+uvicorn servicos.recuperacao.app:app --port 8002
+uvicorn servicos.geracao.app:app --port 8003
+```
+
+Em um quarto terminal, defina a função abaixo para exibir o código HTTP e o
+corpo, inclusive quando o PowerShell 5 recebe um erro:
+
+```powershell
+function Consultar-API([string]$Url) {
+    $body = @{ pergunta = "O que diz o teorema CAP?" } | ConvertTo-Json
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -Uri $Url -Method POST `
+            -ContentType "application/json" -Body $body
+        [PSCustomObject]@{ status = [int]$r.StatusCode; corpo = $r.Content }
+    } catch {
+        $r = $_.Exception.Response
+        if ($null -eq $r) { throw }
+        $leitor = New-Object System.IO.StreamReader($r.GetResponseStream())
+        try {
+            [PSCustomObject]@{ status = [int]$r.StatusCode; corpo = $leitor.ReadToEnd() }
+        } finally { $leitor.Dispose() }
+    }
+}
+
+Consultar-API "http://localhost:8003/perguntar"
+```
+
+1. Com os três serviços ligados e sem `LLM_API_KEY`, espere **200** em
+   `/perguntar`, com resposta simulada. Um índice vazio também permite o teste
+   de disponibilidade, mas retorna contexto vazio.
+2. Desligue apenas a recuperação com `Ctrl+C` no terminal da porta 8002.
+   Execute o comando abaixo: as três consultas falham com **503**; a quarta
+   é recusada pelo circuito, sem novas tentativas HTTP. Confira o log para
+   distinguir `ConnectionError`/`ConnectTimeout` de `CircuitoAberto`.
+
+   ```powershell
+   1..4 | ForEach-Object { Consultar-API "http://localhost:8003/perguntar" }
+   Get-Content logs\http_resiliente.log -Tail 20
+   ```
+
+3. Religue a recuperação com o comando da porta 8002. Aguarde 21 s após a
+   última abertura e consulte `/perguntar` novamente: espere **200**.
+4. Desligue apenas a ingestão com `Ctrl+C` no terminal da porta 8001.
+   Execute quatro consultas diretas à recuperação e uma à geração:
+
+   ```powershell
+   1..4 | ForEach-Object { Consultar-API "http://localhost:8002/buscar" }
+   Consultar-API "http://localhost:8003/perguntar"
+   ```
+
+   Espere **503** nos dois endpoints, com `detail` indicando a dependência
+   indisponível. As chamadas diretas abrem o circuito da ingestão.
+5. Religue a ingestão. Aguarde 21 s após a última abertura de cada circuito e
+   repita as consultas: espere **200** e retomada automática, sem reiniciar os
+   consumidores. Guarde o retorno HTTP e o trecho do log como evidência.
+
+Redis indisponível continua sendo tratado pela ingestão: `POST /indexar`
+deve devolver 503, enquanto `GET /indice` lê o disco e pode continuar
+atendendo a busca. A protecao do LLM do Daniel tambem esta integrada: nas duas
+primeiras consultas que esgotam as tentativas do LLM, a API preserva fontes e
+contexto e retorna 200 com `degradado: true`. A terceira abre o circuito e retorna
+503; consultas seguintes sao recusadas ate a sondagem apos 20 segundos.
+O timeout do LLM e configurado por `LLM_TIMEOUT`; as tres tentativas usam pausas
+de 0,5 s e 1 s. Sem `LLM_API_KEY`, continua funcionando no modo simulado.
+O Compose do Luis Felipe esta integrado. Para testar as falhas com containers,
+use `docker compose stop recuperacao` e `docker compose start recuperacao`,
+ou os mesmos comandos para `ingestao`. A execucao de containers nao foi validada
+nesta maquina porque Docker nao esta instalado.
 
 ---
 

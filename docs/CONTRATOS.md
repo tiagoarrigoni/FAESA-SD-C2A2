@@ -118,6 +118,12 @@ vetorização.
 | circuito do LLM aberto | 503 `{"detail": "LLM indisponivel: circuito aberto, tente em N s"}` |
 | recuperação fora do ar | 503 |
 
+A integracao das tarefas 3 e 3b preserva `contexto` junto com `fontes` e
+`degradado`. Enquanto o circuito do LLM estiver fechado, uma consulta que
+esgota as retentativas retorna 200 com `degradado: true`, texto de contingencia
+e as fontes recuperadas. A terceira consulta consecutiva malsucedida abre o
+circuito e retorna 503; a proxima sondagem e admitida apos 20 segundos.
+
 ### `GET /saude`
 
 ```json
@@ -151,6 +157,7 @@ Formato de uma tarefa na fila:
 | `INDICE_PATH` | `dados/indice.json` | ingestão, worker |
 | `URL_INGESTAO` | `http://localhost:8001` | recuperação |
 | `URL_RECUPERACAO` | `http://localhost:8002` | geração |
+| `URL_GERACAO` | `http://localhost:8003` | demo.py no host |
 | `LLM_API_KEY` | vazio (modo simulado) | geração — **nunca no código** |
 | `LLM_API_URL`, `LLM_MODELO`, `LLM_TIMEOUT` | ver `.env.example` | geração |
 

@@ -7,14 +7,16 @@ Rodar: uvicorn servicos.recuperacao.app:app --port 8002
 """
 import os
 
-import requests
-from fastapi import FastAPI
+import requests  # Mantem compatibilidade com os mocks dos testes de recuperacao.
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from servicos.comum.embeddings import Vetorizador, similaridade
+from servicos.comum.http_resiliente import ClienteHTTPResiliente, ServicoIndisponivel
 
 app = FastAPI(title="Recuperacao - C2.A2")
 URL_INGESTAO = os.getenv("URL_INGESTAO", "http://localhost:8001")
+cliente_ingestao = ClienteHTTPResiliente("ingestao")
 
 
 class Consulta(BaseModel):
@@ -25,9 +27,13 @@ class Consulta(BaseModel):
 @app.post("/buscar")
 def buscar(consulta: Consulta):
     """Deve devolver os top_k trechos mais parecidos com a pergunta."""
-    r = requests.get(f"{URL_INGESTAO}/indice", timeout=10)
-    r.raise_for_status()
-    itens = r.json()["itens"]
+    try:
+        dados = cliente_ingestao.solicitar_json(
+            "GET", f"{URL_INGESTAO}/indice", campo_lista="itens"
+        )
+    except ServicoIndisponivel as erro:
+        raise HTTPException(503, str(erro)) from erro
+    itens = dados["itens"]
 
     
     # Se nao houver documentos, retorna uma lista vazia
