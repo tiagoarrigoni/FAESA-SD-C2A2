@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 
 from servicos.comum.http_resiliente import ClienteHTTPResiliente
+from servicos.comum.circuit_breaker import CircuitBreaker
 
 geracao = importlib.import_module("servicos.geracao.app")
 recuperacao = importlib.import_module("servicos.recuperacao.app")
@@ -43,6 +44,8 @@ class TestResilienciaServicos(unittest.TestCase):
     def setUp(self):
         self.recursos = ExitStack()
         self.addCleanup(self.recursos.close)
+        self.recursos.enter_context(patch.object(geracao, "disjuntor", CircuitBreaker(3, 20)))
+        self.recursos.enter_context(patch.object(geracao, "BACKOFF_INICIAL", 0))
         self.estado = {"status": 200, "chamadas": 0}
         ingestao_simulada = FastAPI()
 
@@ -79,6 +82,8 @@ class TestResilienciaServicos(unittest.TestCase):
         self.assertEqual(resposta.status_code, 200)
         self.assertEqual(resposta.json()["contexto"], ["CAP: consistencia e disponibilidade"])
         self.assertIn("MODO SIMULADO", resposta.json()["resposta"])
+        self.assertEqual(resposta.json()["fontes"], ["cap.txt"])
+        self.assertFalse(resposta.json()["degradado"])
         self.assertEqual(self.estado["chamadas"], 1)
 
     def test_ingestao_falha_503_abre_e_volta_apos_sondagem(self):
@@ -137,6 +142,49 @@ class TestResilienciaServicos(unittest.TestCase):
         geracao.cliente_recuperacao.disjuntor.aberto_em -= 21
         self.assertEqual(self.perguntar().status_code, 200)
         self.assertEqual(geracao.cliente_recuperacao.disjuntor.estado, "fechado")
+
+    def test_llm_indisponivel_contingencia_abertura_e_recuperacao(self):
+        with patch.object(geracao, "gerar", side_effect=requests.Timeout()) as llm:
+            for _ in range(2):
+                resposta = self.perguntar()
+                self.assertEqual(resposta.status_code, 200)
+                dados = resposta.json()
+                self.assertTrue(dados["degradado"])
+                self.assertEqual(dados["fontes"], ["cap.txt"])
+                self.assertEqual(dados["contexto"], ["CAP: consistencia e disponibilidade"])
+            for _ in range(2):
+                resposta = self.perguntar()
+                self.assertEqual(resposta.status_code, 503)
+                self.assertIn("LLM", resposta.json()["detail"])
+            self.assertEqual(llm.call_count, 9)
+        self.assertEqual(geracao.disjuntor.estado, "aberto")
+        self.assertEqual(geracao.cliente_recuperacao.disjuntor.estado, "fechado")
+        self.assertEqual(recuperacao.cliente_ingestao.disjuntor.estado, "fechado")
+        geracao.disjuntor.aberto_em -= 21
+        with patch.object(geracao, "gerar", return_value="LLM voltou") as llm:
+            resposta = self.perguntar()
+        self.assertEqual(resposta.status_code, 200)
+        self.assertEqual(resposta.json()["resposta"], "LLM voltou")
+        self.assertFalse(resposta.json()["degradado"])
+        self.assertEqual(geracao.disjuntor.estado, "fechado")
+        llm.assert_called_once()
+
+    def test_llm_falha_transitoria_recupera_sem_abrir_circuito(self):
+        with patch.object(geracao, "gerar", side_effect=[requests.Timeout(), "Resposta CAP"]) as llm:
+            resposta = self.perguntar()
+        self.assertEqual(resposta.status_code, 200)
+        self.assertFalse(resposta.json()["degradado"])
+        self.assertEqual(llm.call_count, 2)
+        self.assertEqual(geracao.disjuntor.falhas, 0)
+
+    def test_llm_sondagem_com_falha_reabre(self):
+        geracao.disjuntor.estado = "aberto"
+        geracao.disjuntor.aberto_em = time.monotonic() - 21
+        with patch.object(geracao, "gerar", side_effect=requests.ConnectionError()) as llm:
+            resposta = self.perguntar()
+        self.assertEqual(resposta.status_code, 503)
+        self.assertEqual(llm.call_count, 3)
+        self.assertEqual(geracao.disjuntor.estado, "aberto")
 
 
 if __name__ == "__main__":
