@@ -1,301 +1,145 @@
-# Kit de Partida — C2.A2: RAG Distribuído em Microsserviços
+# FAESA - Sistemas Distribuídos (C2.A2)
+## Sistema RAG Distribuído com Microsserviços, Mensageria e Resiliência
 
-**Sistemas Distribuídos e Computação em Nuvem · FAESA · 2026/2**
-Prof. Howard Cruz Roatti · Lançado na Aula 8 (24/09) · Entrega na Aula 12 (29/10)
-
----
-
-## O que é isto
-
-RAG (geração aumentada por recuperação) permite que um modelo de linguagem responda
-com base em documentos **seus**, sem retreinar nada. Do ponto de vista de sistemas
-distribuídos é um caso perfeito: **três responsabilidades distintas** que conversam
-entre si, com uma **dependência externa lenta e instável** (a API do LLM) que precisa
-ser protegida.
-
-> **Sobre a IA neste trabalho:** todo contato com inteligência artificial aqui é
-> **chamada de biblioteca ou de API**. Você **não vai treinar modelos** nem precisar de
-> matemática de aprendizado de máquina. O modelo já vem pronto e configurado.
-> A sua nota vem da **engenharia distribuída**: arquitetura, comunicação, resiliência e
-> execução reproduzível — a sofisticação do modelo **não pontua**.
+Este repositório contém a implementação do trabalho C2.A2 da disciplina de **Sistemas Distribuídos** da FAESA. O projeto consiste em uma arquitetura de **Geração Aumentada por Recuperação (RAG)** construída em microsserviços desacoplados, orientada a eventos com mensageria assíncrona via Redis, mecanismos de resiliência e validação ponta a ponta.
 
 ---
 
-## Como começar
+## Arquitetura e Fluxo de Dados
 
+```mermaid
+flowchart TD
+    subgraph Cliente [" Cliente / Demonstração"]
+        A[demo.py]
+    end
+
+    subgraph Ingestao [" Serviço de Ingestão (Porta 8001)"]
+        B[API /indexar]
+    end
+
+    subgraph Mensageria [" Fila de Mensagens"]
+        C[(Redis Queue)]
+    end
+
+    subgraph WorkerService ["Processamento Assíncrono"]
+        D[Worker de Ingestão]
+    end
+
+    subgraph Armazenamento ["Persistência Vetorial"]
+        G[(dados/indice.json)]
+    end
+
+    subgraph Recuperacao ["Serviço de Recuperação (Porta 8002)"]
+        E[API /buscar]
+    end
+
+    subgraph Geracao [" Serviço de Geração (Porta 8003)"]
+        F[API /perguntar]
+    end
+
+    A -->|1. POST /indexar| B
+    B -->|2. Enfileira Tarefa| C
+    B -.->|Devolve 202 Accepted| A
+    C -->|3. Consome Tarefa| D
+    D -->|4. Vetoriza & Grava| G
+    A -->|5. POST /perguntar| F
+    F -->|6. Busca Contexto (Circuit Breaker)| E
+    E -->|7. Consulta Índice| G
+    E -->|8. Retorna Trechos| F
+    F -->|9. Resposta + Fontes| A
+```
+
+---
+
+## Estrutura do Projeto
+
+```text
+FAESA-SD-C2A2/
+├── servicos/
+│   ├── ingestao/       # API 8001, armazenamento.py e worker.py (Fila Redis)
+│   ├── recuperacao/    # API 8002 e logica de similaridade
+│   └── geracao/        # API 8003 e integracao com LLM via Circuit Breaker
+├── documentos/         # Arquivos .txt base para ingestao
+├── dados/              # Volume persistente do indice.json compartilhado
+├── tests/              # Testes unitarios e de integracao
+├── docker-compose.yml  # Orquestracao completa (Servicos, Worker, Redis)
+├── Dockerfile          # Configuracao de imagem por microsservico
+├── demo.py             # Script de validacao ponta a ponta com metrica
+└── README.md
+```
+
+---
+
+##  Divisão de Tarefas e Integrantes
+
+### 1. Tiago – Mensageria + Integração
+* Criar o repo a partir do kit, convidar todos e definir os contratos.
+* `POST /indexar` publica os documentos na fila Redis, e um worker de ingestão consome, vetoriza e salva (com retry + dead-letter).
+* Revisar e aprovar os PRs, e integrar tudo na `main`.
+
+### 2. Luis Felipe – Docker
+* Um Dockerfile por serviço (ingestão, recuperação, geração, worker).
+* `docker-compose` completo: Redis, os 3 serviços, worker com 2 réplicas, healthchecks, `depends_on`, volume para o índice e `.env`.
+
+### 3. Eliã – Ingestão (Tarefa 1)
+* Persistir o índice em disco (JSON no volume ou ChromaDB), para que ele não suma ao reiniciar.
+* Corrigir o bug do `INDICE.clear()`, que apaga os documentos antigos a cada `/indexar`.
+* Guardar e devolver a "origem" de cada documento (para citar as fontes).
+
+### 4. Lucas – Recuperação (Tarefa 2)
+* Implementar o `/buscar`: pegar o `/indice` da ingestão, vetorizar a pergunta, calcular `similaridade()` e devolver os `top_k` com score.
+
+### 5. Daniel – Resiliência do LLM (Tarefa 3)
+* Envolver o `gerar()` com o circuit breaker (`disjuntor.chamar`).
+* Retentativa com backoff (3 tentativas) + tempo-limite.
+* Circuito aberto devolve 503 com mensagem clara, e se o LLM falhar o sistema responde de forma degradada, sem quebrar.
+
+### 6. Vinicius – Resiliência entre serviços + testes de falha
+* Timeout + retentativa + disjuntor nas chamadas REST internas (geração → recuperação e recuperação → ingestão).
+* Se um serviço estiver fora, devolver erro claro (503), sem estourar 500.
+* Roteiro/script de testes de falha: simular quedas de containers.
+
+### 7. Davi – Fluxo ponta a ponta + README
+* Script de demonstração (`demo.py`): indexa os arquivos validando status do worker e faz perguntas extraindo fontes e métricas via campo `contexto`.
+* Avaliação automática simples (Cobertura Lexical).
+* Diagrama da arquitetura e README consolidado.
+
+---
+
+##  Como Executar do Zero (Passo a Passo)
+
+**Pré-requisitos:** Docker, Docker Compose e Python 3.10+ instalados.
+
+### 1. Clonar o Repositório do Grupo
 ```bash
-# 1. Clone o kit e entre na pasta
-git clone https://github.com/howardroatti/sd-2026-2-kit-c2a2.git
-cd sd-2026-2-kit-c2a2
+git clone https://github.com/tiagoarrigoni/FAESA-SD-C2A2.git
+cd FAESA-SD-C2A2
+```
 
-# 2. Crie e ative o ambiente virtual
+### 2. Subir a Infraestrutura
+```bash
+docker compose up --build -d
+```
+*Isto irá compilar as imagens e iniciar o Redis, o Worker e os 3 microsserviços. Verifique com `docker compose ps` se todos estão ativos.*
+
+### 3. Preparar o Ambiente e Rodar a Demonstração
+No seu terminal local (fora do Docker), crie um ambiente virtual para não gerar conflitos:
+```bash
 python -m venv .venv
+
 # Windows:
 .venv\Scripts\activate
-# Linux/macOS:
+# Linux/Mac:
 source .venv/bin/activate
 
-# 3. Instale as dependências
-pip install -r requirements.txt
-```
-
-```bash
-# 4. Copie o arquivo de ambiente (funciona offline sem chave de LLM)
-cp .env.example .env
-
-# 5. Com Redis acessivel em localhost:6379, suba cada processo em um terminal
-uvicorn servicos.ingestao.app:app     --port 8001
-uvicorn servicos.recuperacao.app:app  --port 8002
-uvicorn servicos.geracao.app:app      --port 8003
-python -m servicos.ingestao.worker
-
-# 6. Indexe os documentos de teste
-curl -X POST http://localhost:8001/indexar -H "Content-Type: application/json" \
-  -d '[{"texto":"O teorema CAP trata de consistencia e disponibilidade.","origem":"aula11"}]'
-
-# 7. Consulte GET /indexacao/{id} com o id devolvido e aguarde status "pronto".
-# Depois pergunte:
-curl -X POST http://localhost:8003/perguntar -H "Content-Type: application/json" \
-  -d '{"pergunta":"o que diz o teorema CAP?"}'
-```
-
-O arquivo `.env` e lido pelo Docker Compose. Na execucao local acima, as
-variaveis precisam estar no ambiente de cada processo; sem elas, sao usados
-os padroes de localhost e o modo simulado do LLM.
-
-### Execucao com Docker e demonstracao
-
-Com Docker e Compose instalados, na raiz do repositorio:
-
-```powershell
-docker compose up --build -d
-docker compose ps
-```
-
-O Compose inicia Redis, ingestao, recuperacao, geracao e duas replicas do worker,
-compartilhando o volume do indice. Quando os servicos estiverem saudaveis,
-execute a demonstracao no host, com o ambiente virtual ativado:
-
-```powershell
+# Instale os requisitos e rode o fluxo RAG completo:
+pip install requests
 python demo.py
 ```
 
-O script do Davi, ajustado na integracao, envia listas de documentos, acompanha
-cada tarefa ate `pronto` (limite de 60 segundos por tarefa) e so depois pergunta.
-Mostra os nomes das fontes e calcula a cobertura lexical usando `contexto`.
-Essa cobertura mede sobreposicao de palavras, sem avaliar a veracidade da resposta.
-Se a indexacao falhar, a demonstracao termina com codigo 1. Reexecutar o script
-acrescenta os documentos novamente ao indice; use uma base de demonstracao separada
-quando precisar de uma quantidade fixa de documentos.
-
-```mermaid
-flowchart LR
-    Cliente -->|POST /indexar| Ingestao
-    Ingestao --> Redis
-    Redis --> Workers[Dois workers]
-    Workers --> Indice[Indice persistido]
-    Ingestao -->|leitura| Indice
-    Cliente -->|POST /perguntar| Geracao
-    Geracao -->|POST /buscar| Recuperacao
-    Recuperacao -->|GET /indice| Ingestao
-    Geracao --> LLM[LLM ou modo simulado]
-```
-
 ---
 
-## Estrutura do projeto
+##  Resiliência e Testes de Falha
 
-```
-sd-2026-2-kit-c2a2/
-├── servicos/
-│   ├── comum/
-│   │   ├── embeddings.py       # PRONTO - vetorização offline
-│   │   ├── llm.py              # PRONTO - com modo simulado
-│   │   └── circuit_breaker.py  # PRONTO - modelo de referência
-│   ├── ingestao/app.py         # TAREFA 1
-│   ├── recuperacao/app.py      # TAREFA 2
-│   └── geracao/app.py          # TAREFA 3
-├── documentos/                 # base de teste para indexar
-├── docker-compose.yml          # TAREFA 4
-└── TAREFAS.md                  # <- comece por aqui
-```
-
-## Resiliência entre serviços — Vinicius (tarefa 3b)
-
-As chamadas `geração → POST /buscar → recuperação` e
-`recuperação → GET /indice → ingestão` usam o cliente compartilhado em
-`servicos/comum/http_resiliente.py`. A busca por similaridade, a persistência,
-a fila Redis e a chamada ao LLM mantêm suas implementações próprias.
-
-| Proteção | Comportamento |
-|---|---|
-| Timeout de conexão/leitura por tentativa | ingestão: 1 s / 2 s; recuperação: 1 s / 12 s |
-| Retentativa | até 3 tentativas, incluindo a primeira |
-| Backoff exponencial | espera de 0,2 s e 0,4 s entre tentativas |
-| Falhas repetidas | conexão, timeout e HTTP 429, 500, 502, 503, 504 |
-| Circuit breaker | abre após 3 consultas consecutivas malsucedidas, contando uma falha após esgotar as tentativas |
-| Recuperação do circuito | após 20 s, admite uma consulta de teste; sucesso fecha, falha reabre |
-| HTTP 503 | conexão, timeout, erro HTTP, JSON inválido, resposta fora do contrato ou circuito aberto |
-
-Outros erros HTTP (por exemplo, 400/404) e respostas inválidas não são repetidos.
-Cada dependência tem seu próprio circuito, em memória, por processo. O circuito
-do LLM (`disjuntor`) continua separado dos clientes HTTP. O estado `meio` admite
-uma única consulta lógica, incluindo suas tentativas, mesmo com requisições
-simultâneas. Respostas de chamadas antigas não fecham um circuito recém-aberto.
-
-Os 12 s de leitura da recuperação permitem que ela termine suas tentativas de
-acesso à ingestão (até aproximadamente 9,6 s somando os timeouts e o backoff).
-Esses valores são limites de conexão e inatividade de leitura do Requests,
-não um prazo total rígido. As retentativas das duas camadas podem produzir até
-9 acessos à ingestão para uma pergunta antes da abertura do circuito.
-O cliente deve ser usado somente para consultas seguras de repetir, como
-`GET /indice` e `POST /buscar`; não deve envolver `POST /indexar`.
-
-Tentativas, pausas e falhas são registradas em `logs/http_resiliente.log`,
-sem gravar perguntas ou documentos. O formato das respostas de sucesso e os
-campos de `/saude` foram preservados; o log mostra o estado dos circuitos HTTP.
-
-### Testes automatizados
-
-As evidências historicas de 22/10/2026 estão em
-[docs/VALIDACAO_RESILIENCIA.md](docs/VALIDACAO_RESILIENCIA.md). A integracao de
-26/10/2026 combina a protecao REST com a contribuicao do Daniel e resolve o
-500 do LLM registrado naquele baseline. Os resultados atuais estao em
-[docs/VALIDACAO_INTEGRACAO.md](docs/VALIDACAO_INTEGRACAO.md).
-
-Na raiz do repositório, com o ambiente virtual ativado:
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-Os testes incluem os existentes de persistência e similaridade, falhas e
-backoff simulados, concorrência do circuit breaker e testes HTTP reais em
-portas locais temporárias. Verificam 503 quando ingestão ou recuperação estão
-inacessíveis, propagação do 503, abertura e recuperação dos circuitos, além do
-fluxo normal com LLM simulado, contingencia do LLM, abertura e recuperacao do
-circuito do LLM e o contrato da demonstracao. Não exigem Redis, Docker, chave de API, pytest
-ou httpx. A ingestão dos testes HTTP é uma API controlada com índice fixo.
-
-### Roteiro manual de falhas no PowerShell
-
-Reinicie os serviços após atualizar o código. Em três terminais na raiz do
-repositório, com o ambiente virtual ativado, execute respectivamente:
-
-```powershell
-uvicorn servicos.ingestao.app:app --port 8001
-uvicorn servicos.recuperacao.app:app --port 8002
-uvicorn servicos.geracao.app:app --port 8003
-```
-
-Em um quarto terminal, defina a função abaixo para exibir o código HTTP e o
-corpo, inclusive quando o PowerShell 5 recebe um erro:
-
-```powershell
-function Consultar-API([string]$Url) {
-    $body = @{ pergunta = "O que diz o teorema CAP?" } | ConvertTo-Json
-    try {
-        $r = Invoke-WebRequest -UseBasicParsing -Uri $Url -Method POST `
-            -ContentType "application/json" -Body $body
-        [PSCustomObject]@{ status = [int]$r.StatusCode; corpo = $r.Content }
-    } catch {
-        $r = $_.Exception.Response
-        if ($null -eq $r) { throw }
-        $leitor = New-Object System.IO.StreamReader($r.GetResponseStream())
-        try {
-            [PSCustomObject]@{ status = [int]$r.StatusCode; corpo = $leitor.ReadToEnd() }
-        } finally { $leitor.Dispose() }
-    }
-}
-
-Consultar-API "http://localhost:8003/perguntar"
-```
-
-1. Com os três serviços ligados e sem `LLM_API_KEY`, espere **200** em
-   `/perguntar`, com resposta simulada. Um índice vazio também permite o teste
-   de disponibilidade, mas retorna contexto vazio.
-2. Desligue apenas a recuperação com `Ctrl+C` no terminal da porta 8002.
-   Execute o comando abaixo: as três consultas falham com **503**; a quarta
-   é recusada pelo circuito, sem novas tentativas HTTP. Confira o log para
-   distinguir `ConnectionError`/`ConnectTimeout` de `CircuitoAberto`.
-
-   ```powershell
-   1..4 | ForEach-Object { Consultar-API "http://localhost:8003/perguntar" }
-   Get-Content logs\http_resiliente.log -Tail 20
-   ```
-
-3. Religue a recuperação com o comando da porta 8002. Aguarde 21 s após a
-   última abertura e consulte `/perguntar` novamente: espere **200**.
-4. Desligue apenas a ingestão com `Ctrl+C` no terminal da porta 8001.
-   Execute quatro consultas diretas à recuperação e uma à geração:
-
-   ```powershell
-   1..4 | ForEach-Object { Consultar-API "http://localhost:8002/buscar" }
-   Consultar-API "http://localhost:8003/perguntar"
-   ```
-
-   Espere **503** nos dois endpoints, com `detail` indicando a dependência
-   indisponível. As chamadas diretas abrem o circuito da ingestão.
-5. Religue a ingestão. Aguarde 21 s após a última abertura de cada circuito e
-   repita as consultas: espere **200** e retomada automática, sem reiniciar os
-   consumidores. Guarde o retorno HTTP e o trecho do log como evidência.
-
-Redis indisponível continua sendo tratado pela ingestão: `POST /indexar`
-deve devolver 503, enquanto `GET /indice` lê o disco e pode continuar
-atendendo a busca. A protecao do LLM do Daniel tambem esta integrada: nas duas
-primeiras consultas que esgotam as tentativas do LLM, a API preserva fontes e
-contexto e retorna 200 com `degradado: true`. A terceira abre o circuito e retorna
-503; consultas seguintes sao recusadas ate a sondagem apos 20 segundos.
-O timeout do LLM e configurado por `LLM_TIMEOUT`; as tres tentativas usam pausas
-de 0,5 s e 1 s. Sem `LLM_API_KEY`, continua funcionando no modo simulado.
-O Compose do Luis Felipe esta integrado. Para testar as falhas com containers,
-use `docker compose stop recuperacao` e `docker compose start recuperacao`,
-ou os mesmos comandos para `ingestao`. A execucao de containers nao foi validada
-nesta maquina porque Docker nao esta instalado.
-
----
-
-## O que você precisa fazer
-
-Abra o arquivo **`TAREFAS.md`**: ele lista o núcleo obrigatório item a item, indicando
-o arquivo e a aula de referência de cada um.
-
----
-
-## Como você será avaliado
-
-| Critério | Pontos |
-|---|---|
-| Arquitetura e decomposição em serviços | 1,5 |
-| Comunicação funcionando (REST / gRPC / mensageria) | 1,5 |
-| Resiliência e tratamento de falhas | 1,0 |
-| Execução reproduzível (README, container, deploy) | 1,0 |
-| **Sofisticação do modelo de IA** | **não pontua** |
-| **Total** | **5,0** |
-
-**Entrega:** no seu repositório do GitHub, **sem apresentação oral**. Grupos livres.
-
----
-
-## Aulas de referência
-
-- **Aula 8** — Mensageria, eventos e API Gateway
-- **Aula 10** — Replicação, consistência e CAP
-- **Aula 11** — Consenso (Raft) e resiliência: circuit breaker
-- **Aula 6** — IA como serviço (vocabulário: embedding, inferência, LLM)
-
----
-
-## Dúvidas frequentes
-
-**Preciso saber machine learning?** Não. O modelo já está pronto e você só chama uma função.
-
-**E se eu não tiver internet no laboratório?** Tudo neste kit funciona offline. O modelo é
-treinado localmente e o cliente de LLM tem modo simulado.
-
-**Posso trocar a linguagem?** O kit é em Python porque é o ecossistema usado nas aulas.
-Se quiser usar outra linguagem, converse com o professor antes.
-
-**Posso usar IA para me ajudar a programar?** Sim. Este é um trabalho prático feito fora de
-sala, e usar ferramentas de IA é realista. O que se avalia é o **sistema funcionando** e as
-**decisões de arquitetura** — que você precisa saber explicar.
+1. **Teste de Queda da Recuperação (`docker compose stop recuperacao`):** O Serviço de Geração orquestrará a falha via Circuit Breaker e retornará HTTP `503` graciosamente.
+2. **Teste de Queda do Redis (`docker compose stop redis`):** O Serviço de Ingestão alertará sobre a indisponibilidade da fila (HTTP `503`), impedindo o enfileiramento cego de requisições.
