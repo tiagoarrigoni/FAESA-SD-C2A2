@@ -9,6 +9,11 @@ Worker de ingestao: consome a fila, vetoriza e grava o indice (TAREFA 4).
 Como o vocabulario do TF-IDF depende de TODOS os documentos, a cada tarefa
 o worker junta os documentos novos com os ja indexados e revetoriza tudo.
 
+A indexacao e idempotente: um documento com o mesmo texto e origem de um ja
+indexado e ignorado. Assim, uma retentativa depois de o indice ja ter sido
+gravado (ex.: falha ao liberar o lock) ou reenviar os mesmos arquivos nao
+duplica documentos.
+
 Rodar: python -m servicos.ingestao.worker
 Suba mais de um worker e veja as tarefas se dividirem entre eles.
 """
@@ -30,8 +35,12 @@ def indexar(documentos: list) -> int:
     with fila.trava_indice():
         itens = [{"texto": i["texto"], "origem": i["origem"]}
                  for i in armazenamento.carregar()]
-        itens += [{"texto": d["texto"], "origem": d.get("origem", "desconhecida")}
-                  for d in documentos]
+        ja_indexados = {(i["texto"], i["origem"]) for i in itens}
+        for d in documentos:
+            chave = (d["texto"], d.get("origem", "desconhecida"))
+            if chave not in ja_indexados:
+                ja_indexados.add(chave)
+                itens.append({"texto": chave[0], "origem": chave[1]})
 
         vetorizador = Vetorizador()
         vetorizador.ajustar([i["texto"] for i in itens])

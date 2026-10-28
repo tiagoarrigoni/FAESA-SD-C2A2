@@ -86,6 +86,12 @@ class TestResilienciaServicos(unittest.TestCase):
         self.assertFalse(resposta.json()["degradado"])
         self.assertEqual(self.estado["chamadas"], 1)
 
+    def test_pergunta_vazia_e_erro_do_cliente(self):
+        resposta = requests.post(f"{self.geracao_url}/perguntar", json={"pergunta": ""}, timeout=15)
+        self.assertEqual(resposta.status_code, 422)
+        self.assertEqual(self.estado["chamadas"], 0)
+        self.assertEqual(geracao.cliente_recuperacao.disjuntor.estado, "fechado")
+
     def test_ingestao_falha_503_abre_e_volta_apos_sondagem(self):
         self.estado["status"] = 503
         for _ in range(3):
