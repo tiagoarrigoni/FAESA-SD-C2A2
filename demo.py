@@ -1,116 +1,99 @@
+"""Demonstra o fluxo indexacao assincrona -> recuperacao -> geracao."""
 import os
+from pathlib import Path
+import sys
 import time
+
 import requests
-import re
 
-# Configurações de URL e Diretórios
-URL_INGESTAO = "http://localhost:8001/indexar"
-URL_GERACAO = "http://localhost:8003/perguntar"
-PASTA_DOCUMENTOS = "documentos"
+URL_INGESTAO = os.getenv("URL_INGESTAO", "http://localhost:8001").rstrip("/")
+URL_GERACAO = os.getenv("URL_GERACAO", "http://localhost:8003").rstrip("/")
+PASTA_DOCS = Path(__file__).resolve().parent / "documentos"
+TIMEOUT_HTTP = (3, 5)
+TIMEOUT_PERGUNTA = (3, 120)  # Inclui as retentativas REST e do LLM.
 
-def calcular_cobertura_lexical(resposta, trechos_recuperados):
-    """Calcula a porcentagem de palavras da resposta presentes nos trechos (fontes)."""
-    if not trechos_recuperados or not resposta:
-        return 0.0
 
-    # Normaliza e extrai palavras (minúsculas, sem pontuação)
-    palavras_resposta = set(re.findall(r'\b\w+\b', resposta.lower()))
-    texto_fontes = " ".join(trechos_recuperados).lower()
-    palavras_fontes = set(re.findall(r'\b\w+\b', texto_fontes))
-    
+def avaliar_cobertura(resposta: str, trechos_recuperados: list[str]) -> float:
+    palavras_resposta = set(resposta.lower().split())
+    palavras_fontes = set(" ".join(trechos_recuperados).lower().split())
     if not palavras_resposta:
         return 0.0
-
-    # Interseção: palavras que estão na resposta E nas fontes
     intersecao = palavras_resposta.intersection(palavras_fontes)
-    cobertura = (len(intersecao) / len(palavras_resposta)) * 100
-    
-    return round(cobertura, 2)
+    return round((len(intersecao) / len(palavras_resposta)) * 100, 2)
 
-def executar_demonstracao():
-    print("="*70)
-    print("INICIANDO INGESTÃO AUTOMÁTICA DE DOCUMENTOS")
-    print("="*70)
 
-    # 1. Fase de Ingestão
-    if not os.path.exists(PASTA_DOCUMENTOS):
-        print(f" Erro: A pasta '{PASTA_DOCUMENTOS}' não existe neste diretório.")
-        return
+def aguardar_indexacao(tarefa_id: str, limite_segundos: float = 60):
+    prazo = time.monotonic() + limite_segundos
+    while time.monotonic() < prazo:
+        resposta = requests.get(f"{URL_INGESTAO}/indexacao/{tarefa_id}", timeout=TIMEOUT_HTTP)
+        resposta.raise_for_status()
+        status = resposta.json()["status"]
+        if status == "pronto":
+            return
+        if status == "falhou":
+            raise RuntimeError(f"indexacao da tarefa {tarefa_id} falhou")
+        if status not in {"na_fila", "processando"}:
+            raise ValueError(f"status de indexacao desconhecido: {status}")
+        time.sleep(min(1, max(0, prazo - time.monotonic())))
+    raise TimeoutError(f"indexacao da tarefa {tarefa_id} excedeu {limite_segundos}s")
 
-    arquivos = [f for f in os.listdir(PASTA_DOCUMENTOS) if f.endswith(".txt")]
+
+def indexar_documentos() -> bool:
+    print("=== Iniciando ingestao de documentos ===")
+    arquivos = sorted(PASTA_DOCS.glob("*.txt"))
     if not arquivos:
-        print(f" Nenhum arquivo .txt encontrado na pasta '{PASTA_DOCUMENTOS}'.")
-        return
-
+        print(f"Nenhum documento .txt encontrado em {PASTA_DOCS}.")
+        return False
     for arquivo in arquivos:
-        caminho = os.path.join(PASTA_DOCUMENTOS, arquivo)
-        with open(caminho, 'r', encoding='utf-8') as f:
-            conteudo = f.read()
-
-        # CORREÇÃO CRÍTICA: O contrato exige uma LISTA de objetos (array JSON)
-        payload = [
-            {
-                "texto": conteudo,
-                "origem": arquivo
-            }
-        ]
-        
         try:
-            resposta = requests.post(URL_INGESTAO, json=payload)
-            if resposta.status_code in [200, 202]:
-                print(f" Sucesso ao enviar {arquivo}: Status {resposta.status_code}")
-            else:
-                print(f"❌ Falha ao enviar {arquivo}: Status {resposta.status_code} - {resposta.text}")
-        except Exception as e:
-            print(f" Erro de conexão ao tentar acessar a Ingestão (8001): {e}")
+            payload = [{"texto": arquivo.read_text(encoding="utf-8"), "origem": arquivo.name}]
+            resposta = requests.post(f"{URL_INGESTAO}/indexar", json=payload, timeout=TIMEOUT_HTTP)
+            resposta.raise_for_status()
+            if resposta.status_code != 202:
+                raise ValueError(f"esperado HTTP 202, recebido {resposta.status_code}")
+            tarefa_id = resposta.json()["id"]
+            aguardar_indexacao(tarefa_id)
+            print(f"Indexado {arquivo.name}: tarefa {tarefa_id} pronta.")
+        except (OSError, requests.RequestException, ValueError, KeyError, RuntimeError, TimeoutError) as erro:
+            print(f"Falha ao indexar {arquivo.name}: {erro}")
+            return False
+    return True
 
-    # 2. Aguarda o Worker e o Redis processarem os documentos
-    print("\n Aguardando 8 segundos para o Worker processar a fila do Redis...")
-    time.sleep(8)
 
-    # 3. Fase de Perguntas (RAG)
-    print("\n" + "="*70)
-    print("EXECUÇÃO DAS PERGUNTAS DE DEMONSTRAÇÃO (RAG)")
-    print("="*70 + "\n")
-
+def fazer_perguntas() -> bool:
+    print("\n=== Iniciando teste de perguntas ===")
     perguntas = [
         "O que diz o teorema CAP?",
-        "Quais são os desafios da consistência eventual?",
-        "Como funciona a replicação em sistemas distribuídos?"
+        "Quais sao os desafios da consistencia eventual?",
+        "Como funciona a replicacao em sistemas distribuidos?",
     ]
-
-    for i, pergunta in enumerate(perguntas, 1):
-        print(f"[Pergunta {i}]: {pergunta}")
-        
-        payload_pergunta = {"pergunta": pergunta}
-        
+    sucesso = True
+    for pergunta in perguntas:
+        print(f"\nPergunta: {pergunta}")
         try:
-            resposta = requests.post(URL_GERACAO, json=payload_pergunta)
-            
-            if resposta.status_code == 200:
-                dados = resposta.json()
-                texto_resposta = dados.get("resposta", "")
-                fontes = dados.get("fontes", [])
-                
-                # Extrair apenas os textos das fontes para a métrica
-                trechos_textuais = [f.get("texto", "") if isinstance(f, dict) else str(f) for f in fontes]
-                cobertura = calcular_cobertura_lexical(texto_resposta, trechos_textuais)
-                
-                print(f"Resposta:\n  {texto_resposta.strip()}")
-                print(f"\nCom base nos documentos recuperados:")
-                print(f"Fontes Recuperadas: {len(fontes)} trecho(s)")
-                
-                # Tenta exibir de quais arquivos a resposta veio
-                origens = list(set([f.get("origem", "Desconhecida") for f in fontes if isinstance(f, dict) and "origem" in f]))
-                if origens:
-                    print(f"Arquivos citados: {', '.join(origens)}")
-                    
-                print(f"Métrica - Cobertura Lexical Resposta/Fonte: {cobertura}%\n")
-                print("-" * 70 + "\n")
-            else:
-                print(f" Falha na geração: Status {resposta.status_code} - {resposta.text}\n")
-        except Exception as e:
-            print(f"  Erro de conexão ao tentar acessar a Geração (8003): {e}\n")
+            resposta = requests.post(f"{URL_GERACAO}/perguntar", json={"pergunta": pergunta},
+                                     timeout=TIMEOUT_PERGUNTA)
+            resposta.raise_for_status()
+            dados = resposta.json()
+            texto = dados["resposta"]
+            cobertura = avaliar_cobertura(texto, dados.get("contexto", []))
+            print(f"Resposta: {texto}")
+            print(f"Cobertura lexical: {cobertura}% das palavras estao no contexto recuperado.")
+            print(f"Fontes utilizadas: {dados.get('fontes', [])}")
+            if dados.get("degradado"):
+                print("LLM indisponivel: resposta de contingencia, consulte as fontes.")
+        except (requests.RequestException, ValueError, KeyError) as erro:
+            print(f"Falha na geracao: {erro}")
+            sucesso = False
+    return sucesso
+
+
+def main() -> int:
+    if not indexar_documentos():
+        print("Demonstracao interrompida: a indexacao nao foi concluida.")
+        return 1
+    return 0 if fazer_perguntas() else 1
+
 
 if __name__ == "__main__":
-    executar_demonstracao()
+    sys.exit(main())
