@@ -55,6 +55,10 @@ vetorização.
 | lista vazia ou algum `texto` vazio | 400 |
 | Redis fora do ar | 503 |
 
+A indexação é idempotente: o worker ignora documentos com o mesmo `texto` e
+`origem` de um já indexado. Reenviar os mesmos arquivos (ou a retentativa de uma
+tarefa que já gravou o índice) não duplica documentos.
+
 ### `GET /indexacao/{id}` → **200**
 
 ```json
@@ -115,6 +119,7 @@ vetorização.
 
 | Situação | Código |
 |---|---|
+| `pergunta` ausente ou vazia | 422 |
 | circuito do LLM aberto | 503 `{"detail": "LLM indisponivel: circuito aberto, tente em N s"}` |
 | recuperação fora do ar | 503 |
 

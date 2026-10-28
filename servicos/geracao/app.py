@@ -12,7 +12,7 @@ import os
 import time
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from servicos.comum.circuit_breaker import CircuitBreaker, CircuitoAberto
 from servicos.comum.llm import gerar
@@ -41,7 +41,8 @@ cliente_recuperacao = ClienteHTTPResiliente("recuperacao", timeout=(1, 12))
 
 
 class Pergunta(BaseModel):
-    pergunta: str
+    # Pergunta vazia e erro do cliente (422), nao indisponibilidade (503).
+    pergunta: str = Field(min_length=1)
 
 
 def gerar_com_retentativas(pergunta: str, contexto: list) -> str:
