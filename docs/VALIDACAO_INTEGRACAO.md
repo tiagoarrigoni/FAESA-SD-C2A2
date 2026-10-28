@@ -64,3 +64,36 @@ Redis foi testado inacessivel: indexacao e consulta de tarefa retornam 503, enqu
 ## Estado da publicacao
 
 Este documento registra a validacao da branch de integracao. O merge remoto deve ser confirmado no PR #4; sua conclusao nao e pressuposta por estes testes.
+
+---
+
+# Validacao do fluxo com fila e worker — 28/10/2026
+
+Executada sobre a `main` em `f2a40b5` e repetida na branch `feat/tiago-ajustes-finais`. Fecha a lacuna registrada acima: o consumo real da fila e o `demo.py` com worker real.
+
+## Metodo
+
+Sem Docker nesta maquina, o Redis foi substituido por um servidor compativel em TCP (`fakeredis`, com Lua para o lock), na porta 16379. Ingestao, worker, recuperacao e geracao rodaram como processos reais (`uvicorn` e `python -m servicos.ingestao.worker`), em portas temporarias e com indice separado. O `demo.py` usou as variaveis `URL_INGESTAO` e `URL_GERACAO` apontando para esses processos. LLM em modo simulado.
+
+## Resultados
+
+| Cenario | Resultado |
+|---|---|
+| `demo.py`: indexa os 3 arquivos pela fila, aguarda `pronto` e faz 3 perguntas | codigo de saida 0; fontes e cobertura lexical (79% a 84%) exibidas |
+| `demo.py` executado de novo (idempotencia) | codigo 0; indice continua com 3 documentos |
+| 6 indexacoes enviadas de uma vez | 6 tarefas `pronto`; indice com 9 documentos |
+| Ingestao reiniciada | indice preservado (9 documentos) |
+| `POST /perguntar` com pergunta vazia | 422 |
+| `POST /indexar` com lista vazia | 400 |
+| Recuperacao encerrada, 4 perguntas | 503 nas 4; a quarta recusada pelo circuito |
+
+Suite automatizada: **39 testes passando** (`python -m unittest discover -s tests -v`).
+
+## Achado corrigido
+
+Na primeira execucao, uma falha de conexao com o Redis ao liberar o lock fez o worker repetir uma tarefa que ja tinha gravado o indice, e o mesmo documento ficou 3 vezes no indice. O worker agora ignora documentos com mesmo texto e origem de um ja indexado (`tests/test_worker.py`).
+
+## Limites
+
+- O emulador de Redis nao sustenta dois workers em `BLPOP` simultaneo; o fluxo foi validado com um worker. As duas replicas do Compose precisam ser exercitadas com Redis real.
+- `docker compose up --build` continua sem execucao registrada: precisa ser feito em uma maquina com Docker, seguindo o README a partir de um clone limpo.
